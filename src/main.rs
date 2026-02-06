@@ -1,81 +1,56 @@
-use std::{ffi::c_void, fmt::Display, fs::File, io::Read, sync::{Arc, RwLock}};
-use libc::{iovec, pid_t, process_vm_readv, process_vm_writev};
+use std::{collections::HashMap, ffi::c_void, fmt::Display, fs::File, io::{IoSlice, IoSliceMut, Read}, sync::{Arc, RwLock}, thread::JoinHandle};
+use libc::{iovec, pid_t};
+use nix::{errno::Errno, sys::uio::{process_vm_readv, RemoteIoVec, process_vm_writev}, unistd::Pid};
 use rayon::prelude::*;
 
-fn read_from_process<T: Default>(pid: pid_t, address: usize) -> Result<T, isize> {
+fn read_from_process<T: Default>(pid: Pid, address: usize) -> Result<T, Box<dyn std::error::Error>> {
     let mut output: T = T::default();
-    let local_binding = iovec {
-        iov_base: (&mut output as *mut _) as *mut c_void,
-        iov_len: std::mem::size_of::<T>()
+    let buffer: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut((&mut output as *mut T) as *mut u8, std::mem::size_of::<T>())
     };
-    let remote_binding = iovec {
-        iov_base: address as *mut c_void,
-        iov_len: std::mem::size_of::<T>()
-    };
-    let nread = unsafe {
-        process_vm_readv(pid, &local_binding as *const iovec, 1, &remote_binding as *const iovec, 1, 0)
-    };
-    if nread < 0 {
-        return Err(nread);
-    }
+    let local_binding = IoSliceMut::new(buffer);
+    let remote_binding = RemoteIoVec{ base: address, len: std::mem::size_of::<T>() };
+    process_vm_readv(pid, &mut [local_binding], &[remote_binding])?;
     Ok(output)
 }
 
-fn read_bytes_from_process(pid: pid_t, bytes: usize, address: usize) -> Result<Vec<u8>, isize> {
+fn read_bytes_from_process(pid: Pid, bytes: usize, address: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut output: Vec<u8> = Vec::with_capacity(bytes);
     output.resize(bytes, 0);
-    let local_binding: iovec = iovec {
-        iov_base: output.as_mut_ptr() as *mut c_void,
-        iov_len: bytes
-    };
-    let remote_binding: iovec = iovec {
-        iov_base: address as *mut c_void,
-        iov_len: bytes
-    };
-    let nread = unsafe {
-        process_vm_readv(pid, &local_binding as *const iovec, 1, &remote_binding as *const iovec, 1, 0)
-    };
-    if nread < 0 {
-        return Err(nread);
-    }
+    let local_binding = IoSliceMut::new(&mut output);
+    let remote_binding = RemoteIoVec{ base: address, len: bytes };
+    process_vm_readv(pid, &mut [local_binding], &[remote_binding])?;
     Ok(output)
 }
 
-fn write_to_process<T>(pid: pid_t, address: usize, to_write: &mut T) -> Result<(), isize> {
-    let local_binding = iovec {
-        iov_base: (to_write as *mut _) as *mut c_void,
-        iov_len: std::mem::size_of::<T>()
-    };
-    let remote_binding = iovec {
-        iov_base: address as *mut c_void,
-        iov_len: std::mem::size_of::<T>()
-    };
-    let nwritten = unsafe {
-        process_vm_writev(pid, &local_binding as *const iovec, 1, &remote_binding as *const iovec, 1, 0)
-    };
-    if nwritten < 0 {
-        return Err(nwritten);
-    }
+fn write_to_process<T>(pid: Pid, address: usize, to_write: &mut T) -> Result<(), Box<dyn std::error::Error>> {
+    let local_binding = IoSlice::new(unsafe {
+        std::slice::from_raw_parts((to_write as *mut T) as *mut u8, std::mem::size_of::<T>())
+    });
+    let remote_binding = RemoteIoVec{ base: address, len: std::mem::size_of::<T>() };
+    process_vm_writev(pid, &[local_binding], &[remote_binding])?;
     Ok(())
 }
 
-fn find_value<T: Default + PartialEq + Send + Sync>(pid: pid_t, value: T) -> Option<Vec<usize>> {
-    let mut mem_maps_file = File::open(format!("/proc/{}/maps", pid)).ok()?;
+fn find_value<T: Default + PartialEq + Send + Sync>(pid: Pid, value: T) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let mut mem_maps_file = File::open(format!("/proc/{}/maps", pid))?;
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut mem_maps: String = String::new();
-    mem_maps_file.read_to_string(&mut mem_maps).ok()?;
+    mem_maps_file.read_to_string(&mut mem_maps)?;
+    const memory_empty_err: &'static str = "Expected no line in memory map to be empty";
+    const memory_range_err: &'static str = "Expected each memory region to have address ranges";
     for line in mem_maps.lines() {
-        let label = line.split_whitespace().last()?;
+        let label = line.split_whitespace().last().ok_or(memory_empty_err)?;
         let flags: _;
         {
             let mut iter = line.split_whitespace();
-            iter.next()?;
-            flags = iter.next()?;
+            iter.next().ok_or(memory_empty_err)?;
+            flags = iter.next().ok_or::<&str>("Expected each line in memory map to contain memory flags".into())?;
         }
         if flags.contains('r') {
-            let range = line.split_whitespace().next()?.split_once('-')?;
-            let lower = usize::from_str_radix(range.0, 16).ok()?;
-            let higher = usize::from_str_radix(range.1, 16).ok()?;
+            let range = line.split_whitespace().next().ok_or(memory_empty_err)?.split_once('-').ok_or(memory_range_err)?;
+            let lower = usize::from_str_radix(range.0, 16)?;
+            let higher = usize::from_str_radix(range.1, 16)?;
             ranges.push((lower, higher));
         }
     }
@@ -84,9 +59,9 @@ fn find_value<T: Default + PartialEq + Send + Sync>(pid: pid_t, value: T) -> Opt
         let base_address = x.0;
         let num_bytes = x.1 - x.0;
         // Copy the entire memory region, and then iterate over it
-        let data: Result<Vec<u8>, isize> = read_bytes_from_process(pid, num_bytes, base_address);
+        let data: Result<Vec<u8>, Box<dyn std::error::Error>> = read_bytes_from_process(pid, num_bytes, base_address);
         if data.is_err() {
-
+            // TODO: error report maybe?
         }
         else {
             data.unwrap().par_iter().enumerate().for_each(|(offset, x)| {
@@ -105,25 +80,30 @@ fn find_value<T: Default + PartialEq + Send + Sync>(pid: pid_t, value: T) -> Opt
             });
         }
     });
-    Some(Arc::into_inner(found).unwrap().into_inner().unwrap())
+    Ok(Arc::into_inner(found).unwrap().into_inner().unwrap())
 }
 
-fn reduce_found_values<T: Default + PartialEq + Send + Sync>(pid: pid_t, found_values: &mut Vec<usize>, value: T) -> Option<()> {
-    let desired_value = Ok(value);
+fn reduce_found_values<T: Default + PartialEq + Send + Sync>(pid: Pid, found_values: &mut Vec<usize>, value: T) -> Result<(), Box<dyn std::error::Error>> {
     let to_remove: Arc<RwLock<Vec<usize>>> = Arc::new(RwLock::new(Vec::with_capacity(found_values.len())));
     found_values.par_iter().enumerate().for_each(|(index, address)| {
-        if read_from_process(pid, *address) != desired_value {
-            to_remove.write().unwrap().push(index);
+        let read_value: Result<T, _> = read_from_process(pid, *address);
+        match read_value {
+            Ok(x) => {
+                if x != value {
+                    to_remove.write().unwrap().push(index);
+                }
+            }
+            Err(_) => {}
         }
     });
     to_remove.write().unwrap().par_sort();
     for i in to_remove.read().unwrap().iter().rev() {
         found_values.remove(*i);
     }
-    Some(())
+    Ok(())
 }
 
-fn display_found_values<T: Default + Display>(pid: pid_t, found_values: &Vec<usize>) {
+fn display_found_values<T: Default + Display>(pid: Pid, found_values: &Vec<usize>) {
     if found_values.len() > 10 {
         println!("Possible values: {}", found_values.len());
     }
@@ -137,60 +117,25 @@ fn display_found_values<T: Default + Display>(pid: pid_t, found_values: &Vec<usi
     }
 }
 
-fn lock_value<T: Send + Sync + 'static>(mut value: T, address: usize, pid: pid_t) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let local_binding = iovec {
-            iov_base: (&mut value as *mut _) as *mut c_void,
-            iov_len: std::mem::size_of::<T>()
-        };
-        let remote_binding = iovec {
-            iov_base: address as *mut c_void,
-            iov_len: std::mem::size_of::<T>()
-        };
+fn lock_value<T: Send + Sync + 'static>(value: T, address: usize, pid: Pid, locks: &mut HashMap<usize, JoinHandle<()>>) {
+    locks.insert(address, std::thread::spawn(move || {
+        let local_binding = IoSlice::new(unsafe {
+            std::slice::from_raw_parts((&value as *const T) as *const u8, std::mem::size_of::<T>())
+        });
+        let remote_binding = RemoteIoVec{ base: address, len: std::mem::size_of::<T>() };
         loop {
-            unsafe {
-                process_vm_writev(pid, &local_binding as *const iovec, 1, &remote_binding as *const iovec, 1, 0);
-            }
+            process_vm_writev(pid, &[local_binding], &[remote_binding]);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-    })
+    }));
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<String>>();
-    let pid = args[1].parse::<i32>()?;
+    let pid = Pid::from_raw(args[1].parse::<i32>()?);
     let mut buffer: String = String::new();
     let stdin = std::io::stdin();
-    // Attach to the PID
     stdin.read_line(&mut buffer)?;
-    let mut addresses: Vec<usize>;
-    addresses = find_value(pid, buffer.trim().parse::<u8>().unwrap()).unwrap();
     let mut locks: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    loop {
-        display_found_values::<u8>(pid, &addresses);
-        buffer.clear();
-        stdin.read_line(&mut buffer)?;
-        if buffer.contains("stop") {
-            break;
-        }
-        else if buffer.contains("write") {
-            let mut new_value: u8 = buffer.split_whitespace().last().unwrap().trim().parse().unwrap();
-            for address in &addresses {
-                write_to_process(pid, *address, &mut new_value);
-            }
-        }
-        else if buffer.contains("lock") {
-            for _ in 0..locks.len() {
-                locks.pop().unwrap().join().unwrap();
-            }
-            let mut new_value: u8 = buffer.split_whitespace().last().unwrap().trim().parse().unwrap();
-            for address in &addresses {
-                locks.push(lock_value(new_value, *address, pid));
-            }
-        }
-        else {
-            reduce_found_values(pid, &mut addresses, buffer.trim().parse::<u8>().unwrap());
-        }
-    }
     Ok(())
 }
