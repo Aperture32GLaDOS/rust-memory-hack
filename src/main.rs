@@ -154,8 +154,7 @@ impl MemoryInformation {
     }
 
     // This method uses the cache as it is used in the pointer chain finding
-    fn find_and_map_value_by_predicate<T: Sized, Y: Send + Sync, K: Fn(usize, &T) -> (bool, Y) + Sync>(&self, predicate: K) -> Result<Vec<Y>, Box<dyn std::error::Error>> {
-        let found: Arc<RwLock<Vec<Y>>> = Arc::new(RwLock::new(Vec::new()));
+    fn execute_func_on_memory<T: Sized, K: Fn(usize, &T) + Sync>(&self, predicate: K) -> Result<(), Box<dyn std::error::Error>> {
         let cache_ptr = SendSyncRawPointer(self.range_caches.as_ptr() as *mut u8);
         self.cache_offsets.par_iter().zip(self.memory_ranges.par_iter()).for_each(|(cache_offset, range)| {
             let data: &[u8];
@@ -163,7 +162,7 @@ impl MemoryInformation {
             let ref_cache_ptr = &cache_ptr;
             unsafe {
                 let cache_slice_ptr = ref_cache_ptr.0.offset(*cache_offset as isize);
-                data = std::slice::from_raw_parts(*cache_slice_ptr as *const u8, num_bytes);
+                data = std::slice::from_raw_parts(cache_slice_ptr as *const u8, num_bytes);
             }
             data.par_iter().enumerate().for_each(|(offset, x)| {
                 let address = range.0 + offset;
@@ -173,15 +172,12 @@ impl MemoryInformation {
                     let pointer = (x as *const u8) as *const T;
                     unsafe {
                         let data = &*pointer;
-                        let (has_found, mapped) = predicate(address, data);
-                        if has_found {
-                            found.write().unwrap().push(mapped);
-                        }
+                        predicate(address, data);
                     }
                 }
             });
         });
-        Ok(Arc::into_inner(found).unwrap().into_inner().unwrap())
+        Ok(())
     }
 
     fn read_from_process<T: Default + Sized>(&self, address: usize) -> Result<T, Box<dyn std::error::Error>> {
@@ -195,6 +191,20 @@ impl MemoryInformation {
         Ok(output)
     }
 
+    fn read_from_process_cached<T: Default + Sized>(&self, address: usize) -> Result<&T, Box<dyn std::error::Error>> {
+        for (range, cache_offset) in self.memory_ranges.iter().zip(self.cache_offsets.iter()) {
+            if (range.0..range.1).contains(&address) {
+                let mut pointer = self.range_caches.as_ptr() as *const T;
+                unsafe {
+                    pointer = pointer.byte_offset(*cache_offset as isize);
+                    pointer = pointer.byte_offset((address - range.0) as isize);
+                    return Ok(&*pointer);
+                }
+            }
+        }
+        Err("Unable to find address in cache".into())
+    }
+
     fn read_bytes_from_process(&self, bytes: usize, address: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut output: Vec<u8> = Vec::with_capacity(bytes);
         output.resize(bytes, 0);
@@ -204,9 +214,9 @@ impl MemoryInformation {
         Ok(output)
     }
 
-    fn write_to_process<T>(&self, address: usize, to_write: &mut T) -> Result<(), Box<dyn std::error::Error>> {
+    fn write_to_process<T>(&self, address: usize, to_write: &T) -> Result<(), Box<dyn std::error::Error>> {
         let local_binding = IoSlice::new(unsafe {
-            std::slice::from_raw_parts((to_write as *mut T) as *mut u8, std::mem::size_of_val(to_write))
+            std::slice::from_raw_parts((to_write as *const T as *mut T) as *mut u8, std::mem::size_of_val(to_write))
         });
         let remote_binding = RemoteIoVec{ base: address, len: std::mem::size_of_val(to_write) };
         process_vm_writev(self.pid, &[local_binding], &[remote_binding])?;
@@ -294,43 +304,46 @@ impl IncompletePointerChain {
 
     fn get_pointed_address(&self, memory_information: &MemoryInformation) -> Result<usize, Box<dyn std::error::Error>> {
         let mut address = self.base_address;
+        address = *memory_information.read_from_process_cached(address)?;
         for i in 0..(self.offsets.len() - 1) {
             address = ((address as isize) + self.offsets[i]) as usize;
-            address = memory_information.read_from_process(address)?;
+            address = *memory_information.read_from_process_cached(address)?;
         }
         address = ((address as isize) + self.offsets.back().unwrap_or(&0)) as usize;
         Ok(address)
     }
 
-    fn get_pointer_chains(memory_information: &MemoryInformation, final_address: usize, maximum_offset: usize, depth: usize) -> Result<Vec<IncompletePointerChain>, Box<dyn std::error::Error>> {
+    fn get_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, maximum_offset: usize, depth: usize) -> Result<Vec<IncompletePointerChain>, Box<dyn std::error::Error>> {
         let mut current_chains = Arc::new(RwLock::new(vec![Self::from_address(final_address)]));
         let mut next_chains: Arc<RwLock<Vec<IncompletePointerChain>>> = Arc::new(RwLock::new(Vec::new()));
         for _ in 0..depth {
             current_chains.read().unwrap().par_iter().for_each(|x| {
-                let new_chains = memory_information.find_and_map_value_by_predicate(|address, points_to: &usize| {
+                let _ = memory_information.execute_func_on_memory(|address, points_to: &usize| {
                     let offset = x.base_address as isize - *points_to as isize;
                     let within_range = (offset.abs() as usize) <= maximum_offset;
-                    let mut new_chain = x.clone();
-                    new_chain.offsets.push_front(offset);
-                    new_chain.base_address = address;
-                    return (within_range, new_chain);
-                });
-                match new_chains {
-                    Ok(x) => {
-                        next_chains.write().unwrap().extend(x.into_iter());
+                    if within_range {
+                        let mut new_chain = x.clone();
+                        new_chain.offsets.push_front(offset);
+                        new_chain.base_address = address;
+                        next_chains.write().unwrap().push(new_chain);
                     }
-                    Err(_) => {}
-                }
+                });
             });
             std::mem::swap(&mut current_chains, &mut next_chains);
             next_chains.write().unwrap().clear();
+            println!("Pre-pruning: {} chains", current_chains.read().unwrap().len());
+            // At every iteration, prune the chains for incorrect paths
+            memory_information.pause()?;
+            memory_information.update_cache()?;
+            memory_information.resume()?;
+            Self::verify_pointer_chains(memory_information, final_address, &mut current_chains.write().unwrap())?;
+            println!("Post-pruning: {} chains", current_chains.read().unwrap().len());
         }
         Ok(Arc::into_inner(current_chains).unwrap().into_inner().unwrap())
     }
 
     fn verify_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, existing_chains: &mut Vec<IncompletePointerChain>) -> Result<(), Box<dyn std::error::Error>>{
-        memory_information.update_cache()?;
-        let to_remove: Arc<RwLock<BTreeSet<Reverse<usize>>>> = Arc::new(RwLock::new(BTreeSet::new()));
+        let to_remove: Arc<RwLock<BTreeSet<_>>> = Arc::new(RwLock::new(BTreeSet::new()));
         existing_chains.par_iter().enumerate().for_each(|(index, x)| {
             match x.get_pointed_address(memory_information) {
                 Ok(x) => {
@@ -356,6 +369,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer: String = String::new();
     let stdin = std::io::stdin();
     stdin.read_line(&mut buffer)?;
+    let address = usize::from_str_radix(buffer.trim(), 16)?;
+    memory_information.pause()?;
     memory_information.update_cache()?;
+    memory_information.update_memory_ranges()?;
+    memory_information.resume()?;
+    let mut pointer_chains = IncompletePointerChain::get_pointer_chains(&mut memory_information, address, 0xfff, 3)?;
+    println!("{} possible pointer chains", pointer_chains.len());
+    // let mut possible_addresses: Vec<usize> = memory_information.find_value(buffer.trim().parse::<u8>()?)?;
+    // loop {
+    //     buffer.clear();
+    //     stdin.read_line(&mut buffer)?;
+    //     memory_information.pause()?;
+    //     memory_information.update_memory_ranges()?;
+    //     memory_information.reduce_found_values(&mut possible_addresses, buffer.trim().parse::<u8>()?)?;
+    //     memory_information.resume()?;
+    //     println!("{} possibilities", possible_addresses.len());
+    //     if possible_addresses.len() < 10 {
+    //         println!("{:x}", possible_addresses[0]);
+    //     }
+    // }
     Ok(())
 }
