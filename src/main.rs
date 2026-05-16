@@ -87,7 +87,7 @@ fn find_value<T: PartialEq + Send + Sync>(pid: Pid, value: T) -> Result<Vec<usiz
     Ok(Arc::into_inner(found).unwrap().into_inner().unwrap())
 }
 
-fn find_value_by_predicate<T>(pid: Pid, predicate: fn(&T) -> bool) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+fn find_value_by_predicate<T, K: Fn(&T) -> bool + Sync>(pid: Pid, predicate: K) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
     let ranges = get_possible_memory_ranges(pid)?;
     let found: Arc<RwLock<Vec<usize>>> = Arc::new(RwLock::new(Vec::new()));
     ranges.par_iter().for_each(|x| {
@@ -109,6 +109,38 @@ fn find_value_by_predicate<T>(pid: Pid, predicate: fn(&T) -> bool) -> Result<Vec
                         let data = &*pointer;
                         if predicate(data) {
                             found.write().unwrap().push(address);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    Ok(Arc::into_inner(found).unwrap().into_inner().unwrap())
+}
+
+fn find_and_map_value_by_predicate<T, Y: Send + Sync, K: Fn(usize, &T) -> (bool, Y) + Sync>(pid: Pid, predicate: K) -> Result<Vec<Y>, Box<dyn std::error::Error>> {
+    let ranges = get_possible_memory_ranges(pid)?;
+    let found: Arc<RwLock<Vec<Y>>> = Arc::new(RwLock::new(Vec::new()));
+    ranges.par_iter().for_each(|x| {
+        let base_address = x.0;
+        let num_bytes = x.1 - x.0;
+        // Copy the entire memory region, and then iterate over it
+        let data: Result<Vec<u8>, Box<dyn std::error::Error>> = read_bytes_from_process(pid, num_bytes, base_address);
+        if data.is_err() {
+            // TODO: error report maybe?
+        }
+        else {
+            data.unwrap().par_iter().enumerate().for_each(|(offset, x)| {
+                let address = base_address + offset;
+                // If we cannot read the required number of bytes, then do not attempt to
+                if offset + std::mem::size_of::<T>() >= num_bytes {}
+                else {
+                    let pointer = (x as *const u8) as *const T;
+                    unsafe {
+                        let data = &*pointer;
+                        let (has_found, mapped) = predicate(address, data);
+                        if has_found {
+                            found.write().unwrap().push(mapped);
                         }
                     }
                 }
