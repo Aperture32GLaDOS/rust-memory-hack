@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, fs::File, io::{IoSlice, IoSliceMut, Read}, sync::{atomic::AtomicBool, Arc, RwLock}, thread::JoinHandle};
+use std::{collections::HashMap, fs::File, io::{IoSlice, IoSliceMut, Read}, sync::{atomic::AtomicBool, Arc, RwLock}};
 use nix::{sys::uio::{process_vm_readv, RemoteIoVec, process_vm_writev}, unistd::Pid};
 use rayon::prelude::*;
 
@@ -138,7 +138,7 @@ fn reduce_found_values<T: Default + PartialEq + Send + Sync>(pid: Pid, found_val
     Ok(())
 }
 
-fn reduce_found_values_by_predicate<T: Default>(pid: Pid, found_values: &mut Vec<usize>, predicate: fn(&T) -> bool) -> Result<(), Box<dyn std::error::Error>> {
+fn reduce_found_values_by_predicate<T: Default, K: Fn(&T) -> bool + Sync>(pid: Pid, found_values: &mut Vec<usize>, predicate: K) -> Result<(), Box<dyn std::error::Error>> {
     let to_remove: Arc<RwLock<Vec<usize>>> = Arc::new(RwLock::new(Vec::with_capacity(found_values.len())));
     found_values.par_iter().enumerate().for_each(|(index, address)| {
         let read_value: Result<T, _> = read_from_process(pid, *address);
