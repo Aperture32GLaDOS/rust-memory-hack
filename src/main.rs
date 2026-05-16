@@ -1,10 +1,12 @@
-use std::{collections::HashMap, fs::File, io::{IoSlice, IoSliceMut, Read}, sync::{atomic::AtomicBool, Arc, RwLock}};
+#![allow(dead_code)]
+use std::{collections::{HashMap, VecDeque}, fs::File, io::{IoSlice, IoSliceMut, Read}, sync::{atomic::AtomicBool, Arc, RwLock}};
 use nix::{sys::{uio::{process_vm_readv, RemoteIoVec, process_vm_writev}, ptrace::{seize, interrupt, cont, Options}}, unistd::Pid, };
 use rayon::prelude::*;
 
 struct MemoryInformation {
     pid: Pid,
     // TODO: store more information (i.e. the flags, label, etc.)
+    // Maybe cache the memory ranges? Might be quicker for pointer chain scanning
     memory_ranges: Vec<(usize, usize)>,
     locks: HashMap<usize, Arc<AtomicBool>>
 }
@@ -236,6 +238,55 @@ impl MemoryInformation {
             }
             None => {}
         }
+    }
+}
+
+#[derive(Clone)]
+struct IncompletePointerChain {
+    base_address: usize,
+    // VecDeque to quickly insert at the front
+    offsets: VecDeque<isize>
+}
+
+impl IncompletePointerChain {
+    fn from_address(address: usize) -> Self {
+        Self { base_address: address, offsets: VecDeque::new() }
+    }
+
+    fn get_pointed_address(&self, memory_information: &MemoryInformation) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut address = self.base_address;
+        for i in 0..(self.offsets.len() - 1) {
+            address = ((address as isize) + self.offsets[i]) as usize;
+            address = memory_information.read_from_process(address)?;
+        }
+        address = ((address as isize) + self.offsets.back().unwrap_or(&0)) as usize;
+        Ok(address)
+    }
+
+    fn get_pointer_chains(memory_information: &MemoryInformation, final_address: usize, maximum_offset: usize, depth: usize) -> Result<Vec<IncompletePointerChain>, Box<dyn std::error::Error>> {
+        let mut current_chains = Arc::new(RwLock::new(vec![Self::from_address(final_address)]));
+        let mut next_chains: Arc<RwLock<Vec<IncompletePointerChain>>> = Arc::new(RwLock::new(Vec::new()));
+        for _ in 0..depth {
+            current_chains.read().unwrap().par_iter().for_each(|x| {
+                let new_chains = memory_information.find_and_map_value_by_predicate(|address, points_to: &usize| {
+                    let offset = x.base_address as isize - *points_to as isize;
+                    let within_range = (offset.abs() as usize) <= maximum_offset;
+                    let mut new_chain = x.clone();
+                    new_chain.offsets.push_front(offset);
+                    new_chain.base_address = address;
+                    return (within_range, new_chain);
+                });
+                match new_chains {
+                    Ok(x) => {
+                        next_chains.write().unwrap().extend(x.into_iter());
+                    }
+                    Err(_) => {}
+                }
+            });
+            std::mem::swap(&mut current_chains, &mut next_chains);
+            next_chains.write().unwrap().clear();
+        }
+        Ok(Arc::into_inner(current_chains).unwrap().into_inner().unwrap())
     }
 }
 
