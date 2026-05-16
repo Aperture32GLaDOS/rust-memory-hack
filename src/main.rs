@@ -3,20 +3,61 @@ use std::{collections::{HashMap, VecDeque}, fs::File, io::{IoSlice, IoSliceMut, 
 use nix::{sys::{uio::{process_vm_readv, RemoteIoVec, process_vm_writev}, ptrace::{seize, interrupt, cont, Options}}, unistd::Pid, };
 use rayon::prelude::*;
 
+#[derive(Clone)]
+struct SendSyncRawPointer<T>(*mut T);
+
+unsafe impl<T> Send for SendSyncRawPointer<T> {}
+unsafe impl<T> Sync for SendSyncRawPointer<T> {}
+
 struct MemoryInformation {
     pid: Pid,
     // TODO: store more information (i.e. the flags, label, etc.)
-    // Maybe cache the memory ranges? Might be quicker for pointer chain scanning
     memory_ranges: Vec<(usize, usize)>,
+    cache_offsets: Vec<usize>,
+    range_caches: Vec<u8>,
     locks: HashMap<usize, Arc<AtomicBool>>
 }
 
 impl MemoryInformation {
     fn from_pid(pid: Pid) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut information = Self{ pid, memory_ranges: Vec::new(), locks: HashMap::new() };
+        let mut information = Self{ pid, memory_ranges: Vec::new(), cache_offsets: Vec::new(), range_caches: Vec::new(), locks: HashMap::new() };
         information.update_memory_ranges()?;
         seize(pid, Options::empty())?;
         Ok(information)
+    }
+
+    fn update_cache(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.update_memory_ranges()?;
+        self.cache_offsets.reserve(self.memory_ranges.len());
+        let mut total_memory_length: usize = 0;
+        for range in self.memory_ranges.iter() {
+            let range_length = range.1 - range.0;
+            self.cache_offsets.push(total_memory_length);
+            total_memory_length += range_length;
+        }
+        self.range_caches.reserve(total_memory_length);
+        // Some hacky pointer stuff
+        unsafe {
+            self.range_caches.set_len(total_memory_length);
+        }
+        let range_cache_ptr = SendSyncRawPointer(self.range_caches.as_mut_ptr());
+        self.memory_ranges.par_iter().zip(self.cache_offsets.par_iter()).for_each(|(x, cache_offset)| {
+            let range_length = x.1 - x.0;
+            let range_bytes = self.read_bytes_from_process(range_length, x.0);
+            let cache_ptr = &range_cache_ptr;
+            let cache_slice;
+            unsafe {
+                let cache_slice_ptr = cache_ptr.0.offset(*cache_offset as isize);
+                cache_slice = std::slice::from_raw_parts_mut(cache_slice_ptr, range_length);
+            };
+            match range_bytes {
+                Ok(x) => {
+                    cache_slice.par_iter_mut().zip(x.par_iter()).for_each(|x| *x.0 = *x.1);
+                }
+                Err(_) => {}
+            }
+        });
+        Ok(())
     }
 
     fn pause(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -112,33 +153,33 @@ impl MemoryInformation {
         Ok(Arc::into_inner(found).unwrap().into_inner().unwrap())
     }
 
+    // This method uses the cache as it is used in the pointer chain finding
     fn find_and_map_value_by_predicate<T: Sized, Y: Send + Sync, K: Fn(usize, &T) -> (bool, Y) + Sync>(&self, predicate: K) -> Result<Vec<Y>, Box<dyn std::error::Error>> {
         let found: Arc<RwLock<Vec<Y>>> = Arc::new(RwLock::new(Vec::new()));
-        self.memory_ranges.par_iter().for_each(|x| {
-            let base_address = x.0;
-            let num_bytes = x.1 - x.0;
-            // Copy the entire memory region, and then iterate over it
-            let data: Result<Vec<u8>, Box<dyn std::error::Error>> = self.read_bytes_from_process(num_bytes, base_address);
-            if data.is_err() {
-                // TODO: error report maybe?
+        let cache_ptr = SendSyncRawPointer(self.range_caches.as_ptr() as *mut u8);
+        self.cache_offsets.par_iter().zip(self.memory_ranges.par_iter()).for_each(|(cache_offset, range)| {
+            let data: &[u8];
+            let num_bytes = range.1 - range.0;
+            let ref_cache_ptr = &cache_ptr;
+            unsafe {
+                let cache_slice_ptr = ref_cache_ptr.0.offset(*cache_offset as isize);
+                data = std::slice::from_raw_parts(*cache_slice_ptr as *const u8, num_bytes);
             }
-            else {
-                data.unwrap().par_iter().enumerate().for_each(|(offset, x)| {
-                    let address = base_address + offset;
-                    // If we cannot read the required number of bytes, then do not attempt to
-                    if offset + std::mem::size_of::<T>() >= num_bytes {}
-                    else {
-                        let pointer = (x as *const u8) as *const T;
-                        unsafe {
-                            let data = &*pointer;
-                            let (has_found, mapped) = predicate(address, data);
-                            if has_found {
-                                found.write().unwrap().push(mapped);
-                            }
+            data.par_iter().enumerate().for_each(|(offset, x)| {
+                let address = range.0 + offset;
+                // If we cannot read the required number of bytes, then do not attempt to
+                if offset + std::mem::size_of::<T>() >= num_bytes {}
+                else {
+                    let pointer = (x as *const u8) as *const T;
+                    unsafe {
+                        let data = &*pointer;
+                        let (has_found, mapped) = predicate(address, data);
+                        if has_found {
+                            found.write().unwrap().push(mapped);
                         }
                     }
-                });
-            }
+                }
+            });
         });
         Ok(Arc::into_inner(found).unwrap().into_inner().unwrap())
     }
@@ -298,5 +339,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer: String = String::new();
     let stdin = std::io::stdin();
     stdin.read_line(&mut buffer)?;
+    memory_information.update_cache()?;
     Ok(())
 }
