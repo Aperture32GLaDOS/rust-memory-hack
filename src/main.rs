@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::{collections::{HashMap, VecDeque}, fs::File, io::{IoSlice, IoSliceMut, Read}, sync::{atomic::AtomicBool, Arc, RwLock}};
+use std::{cmp::Reverse, collections::{BTreeSet, HashMap, HashSet, VecDeque}, fs::File, io::{IoSlice, IoSliceMut, Read}, sync::{atomic::AtomicBool, Arc, RwLock}};
 use nix::{sys::{uio::{process_vm_readv, RemoteIoVec, process_vm_writev}, ptrace::{seize, interrupt, cont, Options}}, unistd::Pid, };
 use rayon::prelude::*;
 
@@ -214,41 +214,39 @@ impl MemoryInformation {
     }
 
     fn reduce_found_values<T: Default + PartialEq + Send + Sync>(&self, found_values: &mut Vec<usize>, value: T) -> Result<(), Box<dyn std::error::Error>> {
-        let to_remove: Arc<RwLock<Vec<usize>>> = Arc::new(RwLock::new(Vec::with_capacity(found_values.len())));
+        let to_remove: Arc<RwLock<_>> = Arc::new(RwLock::new(BTreeSet::new()));
         found_values.par_iter().enumerate().for_each(|(index, address)| {
             let read_value: Result<T, _> = self.read_from_process(*address);
             match read_value {
                 Ok(x) => {
                     if x != value {
-                        to_remove.write().unwrap().push(index);
+                        to_remove.write().unwrap().insert(Reverse(index));
                     }
                 }
                 Err(_) => {}
             }
         });
-        to_remove.write().unwrap().par_sort();
-        for i in to_remove.read().unwrap().iter().rev() {
-            found_values.remove(*i);
+        for i in to_remove.read().unwrap().iter() {
+            found_values.remove(i.0);
         }
         Ok(())
     }
 
     fn reduce_found_values_by_predicate<T: Default, K: Fn(&T) -> bool + Sync>(&self, found_values: &mut Vec<usize>, predicate: K) -> Result<(), Box<dyn std::error::Error>> {
-        let to_remove: Arc<RwLock<Vec<usize>>> = Arc::new(RwLock::new(Vec::with_capacity(found_values.len())));
+        let to_remove: Arc<RwLock<_>> = Arc::new(RwLock::new(BTreeSet::new()));
         found_values.par_iter().enumerate().for_each(|(index, address)| {
             let read_value: Result<T, _> = self.read_from_process(*address);
             match read_value {
                 Ok(x) => {
                     if !predicate(&x) {
-                        to_remove.write().unwrap().push(index);
+                        to_remove.write().unwrap().insert(Reverse(index));
                     }
                 }
                 Err(_) => {}
             }
         });
-        to_remove.write().unwrap().par_sort();
-        for i in to_remove.read().unwrap().iter().rev() {
-            found_values.remove(*i);
+        for i in to_remove.read().unwrap().iter() {
+            found_values.remove(i.0);
         }
         Ok(())
     }
@@ -328,6 +326,25 @@ impl IncompletePointerChain {
             next_chains.write().unwrap().clear();
         }
         Ok(Arc::into_inner(current_chains).unwrap().into_inner().unwrap())
+    }
+
+    fn verify_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, existing_chains: &mut Vec<IncompletePointerChain>) -> Result<(), Box<dyn std::error::Error>>{
+        memory_information.update_cache()?;
+        let to_remove: Arc<RwLock<BTreeSet<Reverse<usize>>>> = Arc::new(RwLock::new(BTreeSet::new()));
+        existing_chains.par_iter().enumerate().for_each(|(index, x)| {
+            match x.get_pointed_address(memory_information) {
+                Ok(x) => {
+                    if x != final_address {
+                        to_remove.write().unwrap().insert(Reverse(index));
+                    }
+                }
+                _ => {}
+            }
+        });
+        for index in to_remove.read().unwrap().iter() {
+            existing_chains.remove(index.0);
+        }
+        Ok(())
     }
 }
 
