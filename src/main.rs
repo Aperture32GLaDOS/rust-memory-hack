@@ -330,34 +330,39 @@ impl MemoryInformation {
 #[derive(Eq, Hash, PartialEq, Clone)]
 struct IncompletePointerChain {
     base_address: usize,
-    // VecDeque to quickly insert at the front
-    offsets: VecDeque<isize>
+    offset: isize,
+    // To avoid expensive vectors of offsets being cloned
+    next_chain: Option<Arc<IncompletePointerChain>>
 }
 
 impl IncompletePointerChain {
     fn from_address(address: usize) -> Self {
-        Self { base_address: address, offsets: VecDeque::new() }
+        Self { base_address: address, offset: 0, next_chain: None }
     }
 
     fn get_pointed_address(&self, memory_information: &MemoryInformation) -> Result<usize, Box<dyn std::error::Error>> {
         let mut address = self.base_address;
         // Dereference the base location
         address = *memory_information.read_from_process_cached(address)?;
-        for (index, offset) in self.offsets.iter().enumerate() {
-            // Offset
-            address = (address as isize + offset) as usize;
+        // And add the offset
+        address = (address as isize + self.offset) as usize;
+        let mut next_chain_optional = &self.next_chain;
+        while let Some(next_chain) = next_chain_optional {
+            next_chain_optional = &next_chain.next_chain;
             // Do not dereference at the last offset
-            if index + 1 < self.offsets.len() {
+            if next_chain_optional.is_some() {
                 address = *memory_information.read_from_process_cached(address)?;
             }
+            // Offset
+            address = (address as isize + next_chain.offset) as usize;
         }
 
         Ok(address)
     }
 
     fn get_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, maximum_offset: usize, depth: usize) -> Result<Vec<IncompletePointerChain>, Box<dyn std::error::Error>> {
-        let mut current_chains = Arc::new(RwLock::new(vec![Self::from_address(final_address)]));
-        let mut next_chains: Arc<RwLock<Vec<IncompletePointerChain>>> = Arc::new(RwLock::new(Vec::new()));
+        let mut current_chains = Arc::new(RwLock::new(vec![Arc::new(Self::from_address(final_address))]));
+        let mut next_chains: Arc<RwLock<Vec<Arc<IncompletePointerChain>>>> = Arc::new(RwLock::new(Vec::new()));
         // Vector of tuples of (my_address, what_i_point_to)
         // We can sort this vector by what_i_point_to to efficiently extract slices of addresses which
         // point to values within a certain range
@@ -372,17 +377,18 @@ impl IncompletePointerChain {
                 let upper_bound_index = all_possible_pointer_values.partition_point(|(_address, pointed_to)| *pointed_to < upper_bound);
                 let possible_pointer_slice = &all_possible_pointer_values[lower_bound_index..upper_bound_index];
                 for pointer in possible_pointer_slice.iter() {
-                    let mut new_chain = x.clone();
-                    new_chain.base_address = pointer.0;
-                    let offset = (x.base_address as isize) - (pointer.1) as isize;
-                    new_chain.offsets.push_front(offset);
-                    next_chains.write().unwrap().push(new_chain);
+                    let new_chain = IncompletePointerChain {
+                        base_address: pointer.0,
+                        offset: (x.base_address as isize) - (pointer.1) as isize,
+                        next_chain: Some(x.clone())
+                    };
+                    next_chains.write().unwrap().push(Arc::new(new_chain));
                 }
             });
             std::mem::swap(&mut current_chains, &mut next_chains);
             next_chains.write().unwrap().clear();
         }
-        Ok(Arc::into_inner(current_chains).unwrap().into_inner().unwrap())
+        Ok(Arc::into_inner(current_chains).unwrap().into_inner().unwrap().into_iter().map(|x| Arc::into_inner(x).unwrap()).collect())
     }
 
     fn verify_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, existing_chains: &mut Vec<IncompletePointerChain>) -> Result<(), Box<dyn std::error::Error>>{
@@ -416,7 +422,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     memory_information.pause()?;
     memory_information.update_cache()?;
     memory_information.resume()?;
-    let pointer_chains = IncompletePointerChain::get_pointer_chains(&mut memory_information, address, 0xfff, 5)?;
+    let pointer_chains = IncompletePointerChain::get_pointer_chains(&mut memory_information, address, 0xfff, 7)?;
     println!("{} possible pointer chains", pointer_chains.len());
     // let mut possible_addresses: Vec<usize> = memory_information.find_value(buffer.trim().parse::<u8>()?)?;
     // loop {
