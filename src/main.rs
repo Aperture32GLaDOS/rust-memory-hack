@@ -368,7 +368,7 @@ impl MemoryInformation {
     }
 }
 
-#[derive(Eq, Hash, PartialEq, Clone)]
+#[derive(Eq, Hash, PartialEq, Clone, Debug)]
 struct IncompletePointerChain {
     base_address: usize,
     offset: isize,
@@ -415,8 +415,9 @@ impl IncompletePointerChain {
         let all_possible_pointer_values = Arc::new(all_possible_pointer_values);
         for _ in 0..depth {
             current_chains.read().unwrap().par_iter().for_each(|x| {
-                let lower_bound = x.base_address;
-                let upper_bound = x.base_address + maximum_offset;
+                // We expect the pointer to point to a slightly lower address
+                let lower_bound = x.base_address - maximum_offset;
+                let upper_bound = x.base_address;
                 let lower_bound_index = all_possible_pointer_values.partition_point(|(_address, pointed_to)| *pointed_to < lower_bound);
                 let mut upper_bound_index = all_possible_pointer_values.partition_point(|(_address, pointed_to)| *pointed_to < upper_bound);
                 while all_possible_pointer_values[upper_bound_index].1 > upper_bound {
