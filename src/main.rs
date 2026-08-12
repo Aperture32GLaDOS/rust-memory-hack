@@ -411,10 +411,10 @@ impl IncompletePointerChain {
         // We can sort this vector by what_i_point_to to efficiently extract slices of addresses which
         // point to values within a certain range
         let mut all_possible_pointer_values: Vec<(usize, usize)> = memory_information.collect_values();
-        all_possible_pointer_values.sort_unstable_by_key(|(_address, pointed_to)| *pointed_to);
+        all_possible_pointer_values.par_sort_unstable_by_key(|(_address, pointed_to)| *pointed_to);
         let all_possible_pointer_values = Arc::new(all_possible_pointer_values);
         for _ in 0..depth {
-            next_chains.write().unwrap().extend(current_chains.read().unwrap().par_iter().map(|x| {
+            current_chains.read().unwrap().par_iter().for_each(|x| {
                 let lower_bound = x.base_address;
                 let upper_bound = x.base_address + maximum_offset;
                 let lower_bound_index = all_possible_pointer_values.partition_point(|(_address, pointed_to)| *pointed_to < lower_bound);
@@ -422,38 +422,57 @@ impl IncompletePointerChain {
                 while all_possible_pointer_values[upper_bound_index].1 > upper_bound {
                     upper_bound_index -= 1;
                 }
+                if lower_bound_index > upper_bound_index {
+                    return;
+                }
+                else if lower_bound_index == upper_bound_index {
+                    let pointer = all_possible_pointer_values[upper_bound_index];
+                    next_chains.write().unwrap().push(Arc::new(IncompletePointerChain {
+                        base_address: pointer.0,
+                        offset: (x.base_address as isize) - (pointer.1) as isize,
+                        next_chain: Some(x.clone())
+                    }));
+                }
                 let possible_pointer_slice = &all_possible_pointer_values[lower_bound_index..upper_bound_index];
-                possible_pointer_slice.iter().map(|pointer| {
+                // Each thread temporarily owns a write-lock to write all its new pointer chains to
+                // the next_chains Vec through one .extend call
+                // (bit slower than having each thread build its own local and then .extend-ing the
+                // next_chains Vec but far nicer on memory usage)
+                next_chains.write().unwrap().extend(possible_pointer_slice.iter().map(|pointer| {
                     let new_chain = IncompletePointerChain {
                         base_address: pointer.0,
                         offset: (x.base_address as isize) - (pointer.1) as isize,
                         next_chain: Some(x.clone())
                     };
                     Arc::new(new_chain)
-                }).collect::<Vec<Arc<IncompletePointerChain>>>()
-            }).flatten().collect::<Vec<Arc<IncompletePointerChain>>>());
+                }));
+            });
             std::mem::swap(&mut current_chains, &mut next_chains);
             next_chains.write().unwrap().clear();
         }
+        // Guaranteed that we can call into_inner on the Vec<Arc<_>> values since they would only be
+        // shared by the next iteration (which, by definition, hasn't been computed yet)
         Ok(Arc::into_inner(current_chains).unwrap().into_inner().unwrap().into_iter().map(|x| Arc::into_inner(x).unwrap()).collect())
     }
 
-    fn verify_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, existing_chains: &mut Vec<IncompletePointerChain>) -> Result<(), Box<dyn std::error::Error>>{
-        let to_remove: Arc<RwLock<BTreeSet<_>>> = Arc::new(RwLock::new(BTreeSet::new()));
-        existing_chains.par_iter().enumerate().for_each(|(index, x)| {
+    // Takes ownership of the existing pointer chains to avoid .clone-ing potentially lots of IncompletePointerChain
+    fn prune_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, existing_chains: Vec<IncompletePointerChain>) -> Result<Vec<IncompletePointerChain>, Box<dyn std::error::Error>>{
+        let to_keep = existing_chains.into_par_iter().filter_map(|x| {
             match x.get_pointed_address(memory_information) {
-                Ok(x) => {
-                    if x != final_address {
-                        to_remove.write().unwrap().insert(Reverse(index));
+                Ok(pointed) => {
+                    if pointed == final_address {
+                        Some(x)
+                    }
+                    else {
+                        None
                     }
                 }
-                _ => {}
+                _ => {
+                    None
+                }
             }
-        });
-        for index in to_remove.read().unwrap().iter() {
-            existing_chains.remove(index.0);
-        }
-        Ok(())
+        }).collect::<Vec<IncompletePointerChain>>();
+        Ok(to_keep)
     }
 }
 
@@ -466,11 +485,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
     stdin.read_line(&mut buffer)?;
     let address = usize::from_str_radix(buffer.trim(), 16)?;
+    buffer.clear();
     memory_information.pause()?;
     memory_information.update_cache()?;
     memory_information.resume()?;
-    let pointer_chains = IncompletePointerChain::get_pointer_chains(&mut memory_information, address, 0xfff, 7)?;
+    let pointer_chains = IncompletePointerChain::get_pointer_chains(&mut memory_information, address, 0xfff, 6)?;
     println!("{} possible pointer chains", pointer_chains.len());
+    stdin.read_line(&mut buffer)?;
+    memory_information.pause()?;
+    memory_information.update_cache()?;
+    memory_information.resume()?;
+    let pointer_chains = IncompletePointerChain::prune_pointer_chains(&mut memory_information, address, pointer_chains)?;
+    println!("After pruning: {} possible pointer chains", pointer_chains.len());
     // let mut possible_addresses: Vec<usize> = memory_information.find_value(buffer.trim().parse::<u8>()?)?;
     // loop {
     //     buffer.clear();
