@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::{cmp::Reverse, collections::{BTreeSet, HashMap, HashSet, VecDeque}, fs::File, io::{IoSlice, IoSliceMut, Read}, ops::RangeInclusive, sync::{Arc, RwLock, atomic::AtomicBool}};
+use std::{cmp::Reverse, collections::{BTreeSet, HashMap}, fs::File, io::{IoSlice, IoSliceMut, Read}, sync::{Arc, RwLock, atomic::AtomicBool}};
 use nix::{sys::{uio::{process_vm_readv, RemoteIoVec, process_vm_writev}, ptrace::{seize, interrupt, cont, Options}}, unistd::Pid, };
 use rayon::prelude::*;
 
@@ -76,17 +76,18 @@ impl MemoryInformation {
         const MEMORY_EMPTY_ERR: &'static str = "Expected no line in memory map to be empty";
         const MEMORY_RANGE_ERR: &'static str = "Expected each memory region to have address ranges";
         for line in mem_maps.lines() {
-            let label = line.split_whitespace().last().ok_or(MEMORY_EMPTY_ERR)?;
+            let label: _;
             let flags: _;
+            let (lower, higher);
             {
                 let mut iter = line.split_whitespace();
-                iter.next().ok_or(MEMORY_EMPTY_ERR)?;
+                let range = iter.next().ok_or(MEMORY_EMPTY_ERR)?.split_once('-').ok_or(MEMORY_RANGE_ERR)?;
+                lower = usize::from_str_radix(range.0, 16)?;
+                higher = usize::from_str_radix(range.1, 16)?;
                 flags = iter.next().ok_or::<&str>("Expected each line in memory map to contain memory flags".into())?;
+                label = iter.last().ok_or(MEMORY_EMPTY_ERR)?;
             }
             if flags.contains('r') {
-                let range = line.split_whitespace().next().ok_or(MEMORY_EMPTY_ERR)?.split_once('-').ok_or(MEMORY_RANGE_ERR)?;
-                let lower = usize::from_str_radix(range.0, 16)?;
-                let higher = usize::from_str_radix(range.1, 16)?;
                 self.memory_ranges.push((lower, higher));
             }
         }
@@ -94,8 +95,7 @@ impl MemoryInformation {
     }
 
     fn find_value<T: PartialEq + Send + Sync>(&self, value: T) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
-        let found: Arc<RwLock<Vec<usize>>> = Arc::new(RwLock::new(Vec::new()));
-        self.memory_ranges.par_iter().for_each(|x| {
+        let found = self.memory_ranges.par_iter().filter_map(|x| {
             let mut base_address = x.0;
             // Align the base address
             base_address += std::mem::align_of::<T>() - (base_address % std::mem::align_of::<T>());
@@ -104,30 +104,35 @@ impl MemoryInformation {
             let data: Result<Vec<u8>, Box<dyn std::error::Error>> = self.read_bytes_from_process(num_bytes, base_address);
             if data.is_err() {
                 // TODO: error report maybe?
+                return None;
             }
             else {
-                data.unwrap().par_iter().enumerate().step_by(std::mem::align_of::<T>()).for_each(|(offset, x)| {
+                Some(data.unwrap().par_iter().enumerate().step_by(std::mem::align_of::<T>()).filter_map(|(offset, x)| {
                     let address = base_address + offset;
                     // If we cannot read the required number of bytes, then do not attempt to
-                    if offset + std::mem::size_of_val(&value) >= num_bytes {}
+                    if offset + std::mem::size_of_val(&value) >= num_bytes {
+                        return None;
+                    }
                     else {
                         let pointer = (x as *const u8) as *const T;
                         unsafe {
                             let data = &*pointer;
                             if *data == value {
-                                found.write().unwrap().push(address);
+                                return Some(address);
+                            }
+                            else {
+                                return None;
                             }
                         }
                     }
-                });
+                }).collect::<Vec<usize>>())
             }
-        });
-        Ok(Arc::into_inner(found).unwrap().into_inner().unwrap())
+        }).flatten().collect::<Vec<usize>>();
+        Ok(found)
     }
 
     fn find_value_by_predicate<T: Sized, K: Fn(&T) -> bool + Sync>(&self, predicate: K) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
-        let found: Arc<RwLock<Vec<usize>>> = Arc::new(RwLock::new(Vec::new()));
-        self.memory_ranges.par_iter().for_each(|x| {
+        let found = self.memory_ranges.par_iter().filter_map(|x| {
             let mut base_address = x.0;
             base_address += std::mem::align_of::<T>() - (base_address % std::mem::align_of::<T>());
             let num_bytes = x.1 - x.0;
@@ -135,25 +140,31 @@ impl MemoryInformation {
             let data: Result<Vec<u8>, Box<dyn std::error::Error>> = self.read_bytes_from_process(num_bytes, base_address);
             if data.is_err() {
                 // TODO: error report maybe?
+                return None;
             }
             else {
-                data.unwrap().par_iter().enumerate().step_by(std::mem::align_of::<T>()).for_each(|(offset, x)| {
+                Some(data.unwrap().par_iter().enumerate().step_by(std::mem::align_of::<T>()).filter_map(|(offset, x)| {
                     let address = base_address + offset;
                     // If we cannot read the required number of bytes, then do not attempt to
-                    if offset + std::mem::size_of::<T>() >= num_bytes {}
+                    if offset + std::mem::size_of::<T>() >= num_bytes {
+                        return None;
+                    }
                     else {
                         let pointer = (x as *const u8) as *const T;
                         unsafe {
                             let data = &*pointer;
                             if predicate(data) {
-                                found.write().unwrap().push(address);
+                                return Some(address);
+                            }
+                            else {
+                                return None;
                             }
                         }
                     }
-                });
+                }).collect::<Vec<usize>>())
             }
-        });
-        Ok(Arc::into_inner(found).unwrap().into_inner().unwrap())
+        }).flatten().collect();
+        Ok(found)
     }
 
     // This method uses the cache as it is used in the pointer chain finding
@@ -185,12 +196,9 @@ impl MemoryInformation {
         Ok(())
     }
 
-    fn collect_values<T: Send + Sync + Copy>(&self) -> Vec<(usize, T)> {
-        let values: Vec<_> = Vec::new();
-        let values = Arc::new(RwLock::new(values));
+    fn collect_values<T: Send + Sync>(&self) -> Vec<(usize, T)> {
         let cache_ptr = SendSyncRawPointer(self.range_caches.as_ptr() as *mut u8);
-        self.cache_offsets.par_iter().zip(self.memory_ranges.par_iter()).for_each(|(cache_offset, range)| {
-            let mut local_values = Vec::new();
+        self.cache_offsets.par_iter().zip(self.memory_ranges.par_iter()).map(|(cache_offset, range)| {
             let cache_ptr_ref = &cache_ptr;
             let ptr = cache_ptr_ref.0;
             let data: &[u8];
@@ -201,20 +209,20 @@ impl MemoryInformation {
                 let cache_slice_ptr = ptr.byte_offset(*cache_offset as isize + (align_offset as isize));
                 data = std::slice::from_raw_parts(cache_slice_ptr, num_bytes - align_offset);
             }
-            for (offset, x) in data.iter().enumerate().step_by(std::mem::align_of::<T>()) {
+            data.par_iter().enumerate().step_by(std::mem::align_of::<T>()).filter_map(|(offset, x)| {
                 let address = base_address + offset + align_offset;
-                if offset + std::mem::size_of::<T>() >= num_bytes {}
+                if offset + std::mem::size_of::<T>() >= num_bytes {
+                    return None;
+                }
                 else {
                     let pointer = (x as *const u8) as *const T;
                     unsafe {
-                        let data = *pointer;
-                        local_values.push((address, data));
+                        let data = std::ptr::read_unaligned(pointer);
+                        return Some((address, data));
                     }
                 }
-            }
-            values.write().unwrap().append(&mut local_values);
-        });
-        Arc::into_inner(values).unwrap().into_inner().unwrap()
+            }).collect::<Vec<(usize, T)>>()
+        }).flatten().collect()
     }
 
     fn read_from_process<T: Default + Sized>(&self, address: usize) -> Result<T, Box<dyn std::error::Error>> {
@@ -260,41 +268,47 @@ impl MemoryInformation {
         Ok(())
     }
 
+    // Shouldn't really use the cache, since this method will be called while the program is
+    // changing
     fn reduce_found_values<T: Default + PartialEq + Send + Sync>(&self, found_values: &mut Vec<usize>, value: T) -> Result<(), Box<dyn std::error::Error>> {
-        let to_remove: Arc<RwLock<_>> = Arc::new(RwLock::new(BTreeSet::new()));
-        found_values.par_iter().enumerate().for_each(|(index, address)| {
+        let mut to_keep = found_values.par_iter().filter_map(|address| {
             let read_value: Result<T, _> = self.read_from_process(*address);
             match read_value {
                 Ok(x) => {
-                    if x != value {
-                        to_remove.write().unwrap().insert(Reverse(index));
+                    if x == value {
+                        return Some(*address);
+                    }
+                    else {
+                        return None;
                     }
                 }
-                Err(_) => {}
+                Err(_) => {
+                    return None;
+                }
             }
-        });
-        for i in to_remove.read().unwrap().iter() {
-            found_values.remove(i.0);
-        }
+        }).collect::<Vec<usize>>();
+        std::mem::swap(found_values, &mut to_keep);
         Ok(())
     }
 
     fn reduce_found_values_by_predicate<T: Default, K: Fn(&T) -> bool + Sync>(&self, found_values: &mut Vec<usize>, predicate: K) -> Result<(), Box<dyn std::error::Error>> {
-        let to_remove: Arc<RwLock<_>> = Arc::new(RwLock::new(BTreeSet::new()));
-        found_values.par_iter().enumerate().for_each(|(index, address)| {
+        let mut to_keep = found_values.par_iter().filter_map(|address| {
             let read_value: Result<T, _> = self.read_from_process(*address);
             match read_value {
                 Ok(x) => {
-                    if !predicate(&x) {
-                        to_remove.write().unwrap().insert(Reverse(index));
+                    if predicate(&x) {
+                        return Some(*address);
+                    }
+                    else {
+                        return None;
                     }
                 }
-                Err(_) => {}
+                Err(_) => {
+                    return None;
+                }
             }
-        });
-        for i in to_remove.read().unwrap().iter() {
-            found_values.remove(i.0);
-        }
+        }).collect::<Vec<usize>>();
+        std::mem::swap(found_values, &mut to_keep);
         Ok(())
     }
 
@@ -360,6 +374,9 @@ impl IncompletePointerChain {
         Ok(address)
     }
 
+    // TODO: this method is very fast, but too permissive with its possible memory chains. At depth
+    // 7, it will happily eat all 64 GB of my RAM on my machine - maybe try restricting early
+    // pointer chains to their own memory region?
     fn get_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, maximum_offset: usize, depth: usize) -> Result<Vec<IncompletePointerChain>, Box<dyn std::error::Error>> {
         let mut current_chains = Arc::new(RwLock::new(vec![Arc::new(Self::from_address(final_address))]));
         let mut next_chains: Arc<RwLock<Vec<Arc<IncompletePointerChain>>>> = Arc::new(RwLock::new(Vec::new()));
@@ -370,21 +387,21 @@ impl IncompletePointerChain {
         all_possible_pointer_values.sort_unstable_by_key(|(_address, pointed_to)| *pointed_to);
         let all_possible_pointer_values = Arc::new(all_possible_pointer_values);
         for _ in 0..depth {
-            current_chains.read().unwrap().par_iter().for_each(|x| {
+            next_chains.write().unwrap().extend(current_chains.read().unwrap().par_iter().map(|x| {
                 let lower_bound = x.base_address;
                 let upper_bound = x.base_address + maximum_offset;
                 let lower_bound_index = all_possible_pointer_values.partition_point(|(_address, pointed_to)| *pointed_to < lower_bound);
                 let upper_bound_index = all_possible_pointer_values.partition_point(|(_address, pointed_to)| *pointed_to < upper_bound);
                 let possible_pointer_slice = &all_possible_pointer_values[lower_bound_index..upper_bound_index];
-                for pointer in possible_pointer_slice.iter() {
+                possible_pointer_slice.iter().map(|pointer| {
                     let new_chain = IncompletePointerChain {
                         base_address: pointer.0,
                         offset: (x.base_address as isize) - (pointer.1) as isize,
                         next_chain: Some(x.clone())
                     };
-                    next_chains.write().unwrap().push(Arc::new(new_chain));
-                }
-            });
+                    Arc::new(new_chain)
+                }).collect::<Vec<Arc<IncompletePointerChain>>>()
+            }).flatten().collect::<Vec<Arc<IncompletePointerChain>>>());
             std::mem::swap(&mut current_chains, &mut next_chains);
             next_chains.write().unwrap().clear();
         }
