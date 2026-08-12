@@ -225,6 +225,33 @@ impl MemoryInformation {
         }).flatten().collect()
     }
 
+    fn collect_values_from_memory_range<T: Send + Sync>(&self, memory_range_index: usize) -> Vec<(usize, T)> {
+        let cache_offset = self.cache_offsets[memory_range_index];
+        let range = self.memory_ranges[memory_range_index];
+        let ptr = self.range_caches.as_ptr();
+        let data: &[u8];
+        let num_bytes = range.1 - range.0;
+        let base_address = range.0;
+        let align_offset = (std::mem::align_of::<T>() - base_address % std::mem::align_of::<T>()) % std::mem::align_of::<T>();
+        unsafe {
+            let cache_slice_ptr = ptr.byte_offset(cache_offset as isize + (align_offset as isize));
+            data = std::slice::from_raw_parts(cache_slice_ptr, num_bytes - align_offset);
+        }
+        data.par_iter().enumerate().step_by(std::mem::align_of::<T>()).filter_map(|(offset, x)| {
+            let address = base_address + offset + align_offset;
+            if offset + std::mem::size_of::<T>() >= num_bytes {
+                return None;
+            }
+            else {
+                let pointer = (x as *const u8) as *const T;
+                unsafe {
+                    let data = std::ptr::read_unaligned(pointer);
+                    return Some((address, data));
+                }
+            }
+        }).collect::<Vec<(usize, T)>>()
+    }
+
     fn read_from_process<T: Default + Sized>(&self, address: usize) -> Result<T, Box<dyn std::error::Error>> {
         let mut output: T = T::default();
         let buffer: &mut [u8] = unsafe {
@@ -391,7 +418,10 @@ impl IncompletePointerChain {
                 let lower_bound = x.base_address;
                 let upper_bound = x.base_address + maximum_offset;
                 let lower_bound_index = all_possible_pointer_values.partition_point(|(_address, pointed_to)| *pointed_to < lower_bound);
-                let upper_bound_index = all_possible_pointer_values.partition_point(|(_address, pointed_to)| *pointed_to < upper_bound);
+                let mut upper_bound_index = all_possible_pointer_values.partition_point(|(_address, pointed_to)| *pointed_to < upper_bound);
+                while all_possible_pointer_values[upper_bound_index].1 > upper_bound {
+                    upper_bound_index -= 1;
+                }
                 let possible_pointer_slice = &all_possible_pointer_values[lower_bound_index..upper_bound_index];
                 possible_pointer_slice.iter().map(|pointer| {
                     let new_chain = IncompletePointerChain {
