@@ -428,24 +428,31 @@ impl IncompletePointerChain {
                 }
                 else if lower_bound_index == upper_bound_index {
                     let pointer = all_possible_pointer_values[upper_bound_index];
-                    next_chains.write().unwrap().push(Arc::new(IncompletePointerChain {
-                        base_address: pointer.0,
-                        offset: (x.base_address as isize) - (pointer.1) as isize,
-                        next_chain: Some(x.clone())
-                    }));
+                    if !x.encounters_other_pointer((pointer.0, (x.base_address as isize) - (pointer.1) as isize)) {
+                        next_chains.write().unwrap().push(Arc::new(IncompletePointerChain {
+                            base_address: pointer.0,
+                            offset: (x.base_address as isize) - (pointer.1) as isize,
+                            next_chain: Some(x.clone())
+                        }));
+                    }
                 }
                 let possible_pointer_slice = &all_possible_pointer_values[lower_bound_index..upper_bound_index];
                 // Each thread temporarily owns a write-lock to write all its new pointer chains to
                 // the next_chains Vec through one .extend call
                 // (bit slower than having each thread build its own local and then .extend-ing the
                 // next_chains Vec but far nicer on memory usage)
-                next_chains.write().unwrap().extend(possible_pointer_slice.iter().map(|pointer| {
+                next_chains.write().unwrap().extend(possible_pointer_slice.iter().filter_map(|pointer| {
                     let new_chain = IncompletePointerChain {
                         base_address: pointer.0,
                         offset: (x.base_address as isize) - (pointer.1) as isize,
                         next_chain: Some(x.clone())
                     };
-                    Arc::new(new_chain)
+                    if x.encounters_other_pointer((new_chain.base_address, new_chain.offset)) {
+                        None
+                    }
+                    else {
+                        Some(Arc::new(new_chain))
+                    }
                 }));
             });
             std::mem::swap(&mut current_chains, &mut next_chains);
@@ -457,7 +464,7 @@ impl IncompletePointerChain {
     }
 
     // Takes ownership of the existing pointer chains to avoid .clone-ing potentially lots of IncompletePointerChain
-    fn prune_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, existing_chains: Vec<IncompletePointerChain>) -> Result<Vec<IncompletePointerChain>, Box<dyn std::error::Error>>{
+    fn prune_pointer_chains(memory_information: &mut MemoryInformation, final_address: usize, existing_chains: Vec<IncompletePointerChain>) -> Result<Vec<IncompletePointerChain>, Box<dyn std::error::Error>> {
         let to_keep = existing_chains.into_par_iter().filter_map(|x| {
             match x.get_pointed_address(memory_information) {
                 Ok(pointed) => {
@@ -474,6 +481,22 @@ impl IncompletePointerChain {
             }
         }).collect::<Vec<IncompletePointerChain>>();
         Ok(to_keep)
+    }
+
+    // Used to detect cycles
+    fn encounters_other_pointer(&self, other: (usize, isize)) -> bool {
+        if self.base_address == other.0 && self.offset == other.1 {
+            true
+        }
+        else {
+            match &self.next_chain {
+                Some(next) => {
+                    next.encounters_other_pointer(other)
+                }
+                None => 
+                    false
+            }
+        }
     }
 }
 
